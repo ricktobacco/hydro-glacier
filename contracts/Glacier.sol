@@ -15,7 +15,15 @@ import "./zeppelin/math/SafeMath.sol";
 
 contract Glacier is SnowflakeResolver
 {   
-    uint constant blocksPerYear = 2102400;
+    /* Constants based on the following
+     * average blocktime = 15.634 secs;
+     * average days per month = 30.438;
+     * average weeks per month = 4.34;
+    */
+    uint constant blocksPerDay = 5526; //(60/15.634)*60*24
+    uint constant blocksPerWeek = 38685; //(60/15.634)*60*24*7
+    uint constant blocksPerMonth = 168210; //(60/15.634)*60*24*(365.25/12)
+    uint constant blocksPerYear = 2018524; //(60/15.634)*60*24*(365.25)
 
     enum Schedule { 
         Hourly, Daily, Weekly,
@@ -47,24 +55,30 @@ contract Glacier is SnowflakeResolver
     // We keep track of the refunds here (debtId => ein => amount)
     mapping (uint256 => mapping (uint256 => uint256)) public refunds;
 
-    struct Debt {
+    struct Debt { //accured interest book-keeping component
         uint256  id;
         Status   status;
         uint     created; // block number of when created
         
         Schedule payments; // scheduled interest payments
         uint     nextPayment; // block number for next payment
+        uint256  numPayments; // the number of payments to be made until endDate
+        uint256  numEscrowed; // the number of payments that must be escrowed
+        uint256  payInterval; // the number of blocks between payments
         
         Schedule accruals; // scheduled interest accrual
         uint     nextAccrual; // block number for next accrual 
-        
+        uint     numAccruals; 
+        uint256  accrualInterval; // the number of blocks between accruals
+
         /* may grow via compound interest or direct deposit,
          * but not be depleted without termination 
         */ 
         uint256  principal;
 
-        /* the cost of debt expressed in annual percentage yield;
-         * paid either to lender (when loaning) or depositor (when saving)
+        /* the cost of debt expressed in absolute terms; ie the
+         * amount which payer must lock up in escrow for payee
+         * to release their principal 
         */ 
         uint256  interest;
 
@@ -80,8 +94,19 @@ contract Glacier is SnowflakeResolver
          * so for savings it's the cost of withdrawal 
         */ 
         uint256  fee;
+        
+        /* the cost of debt expressed in annual percentage yield;
+         * paid either to lender (when loaning) or depositor (when saving)
+        */ 
+        uint256  apr;
 
+        /* also an instance of schedule.
+         * 
+        */
         uint256  expire;
+
+        
+        bool principalOwed; 
     }
 
     event InterestPaid( 
@@ -99,7 +124,7 @@ contract Glacier is SnowflakeResolver
      * becomes irreversibly linked to an escrow, whose state may
      * change based on the following activity related to the debt
     */ 
-    event LockPrincipal(
+    event LockInterest(
         uint256 indexed payer, 
         uint256 indexed debtID, 
         uint256 amount
@@ -111,7 +136,7 @@ contract Glacier is SnowflakeResolver
      * payer's principal is instantly refunded
     */ 
     event ReleasePrincipal(
-        uint256 indexed payer,
+        uint256 indexed payee,
         uint256 indexed debtID,
         uint256 amount
     );
@@ -125,7 +150,7 @@ contract Glacier is SnowflakeResolver
     );
 
     constructor (address snowflakeAddress) public 
-    SnowflakeResolver("Glacier", "Create interest-bearing escrow", 
+    SnowflakeResolver("Glacier", "Interest-bearing Escrow on Snowflake", 
     snowflakeAddress, false, false) { debtIndex = 0; }
 
     /**
@@ -137,7 +162,8 @@ contract Glacier is SnowflakeResolver
      * half a percent origination fee 
      */
     function setInterest(
-        uint256 interest
+        uint256 rate,
+        uint256 fee
     ) public {
         SnowflakeInterface snowflake = SnowflakeInterface(snowflakeAddress);
         IdentityRegistryInterface identityRegistry = IdentityRegistryInterface(snowflake.identityRegistryAddress());
@@ -146,44 +172,72 @@ contract Glacier is SnowflakeResolver
         require(identityRegistry.isResolverFor(ein, address(this)), "The EIN has not set this resolver.");
 
         debtIndex += 1;
+
         Debt memory debt = Debt(
             debtIndex, Status.Created, now,
-            Schedule.Monthly, 0, // payment schedule, next date
-            Schedule.Daily, 0, // accrual schedule, next date
-            0, interest, // principal, interest
-            0, 1, 2**256-1 //payer EIN, fee (TODO), expriation
+            Schedule.Monthly, 0, // payments: when, how many, next date
+            Schedule.Daily, 0, // accruals: when, how many, next date,
+            0, 0, 0, fee, // principal, interest, payer EIN, fee
+            rate, 2**256-1, //annual percentage rate, expriation
+            false
         );
         debts[ein][debtIndex] = debt;
         debtToPayee[debtIndex] = ein;
     }
 
     /**
-     * @dev Set principal amount, creating an escrow
+     * @dev Set principal amount
      * @param debtId id of the debt
      * @param amount of the principle to put
+     * Upon debt issuance, collateral tokens
+     * are locked in escrow. 
+     * Effectively borrower is buying back those tokens. 
+     * If borrower is unable to buy back token at a 
+     * scheduled time, lender will repossess tokens
+     * worth that missed payment providing better 
+     * breathing space in tough times.
      */
-    function putPrincipal(
-        uint256 debtId
+    function lockPrincipal(
+        uint256 debtId,
+        uint256 amount
     ) public payable {
         SnowflakeInterface snowflake = SnowflakeInterface(snowflakeAddress);
         IdentityRegistryInterface identityRegistry = IdentityRegistryInterface(snowflake.identityRegistryAddress());
 
         uint256 ein = identityRegistry.getEIN(msg.sender);
         require(identityRegistry.isResolverFor(ein, address(this)), "The EIN has not set this resolver.");
-
+        require(ein == debtToPayee[debtId], "must be the payee");
+        
         Debt memory debt = debts[debtToPayee[debtId]][debtId];
-        if (debt.payer == 0){
-            require(ein != debtToPayee[debtId], "payer cannot also be the payee");
-            debt.payer = ein;
-        } else  
-            require(debt.payer == ein, "only payer can put principal");
-
-        debt.payer = ein;
-        debt.status = Status.Locked;
+        require(!debt.owed == debtToPayee[debtId], "cannot lock more principal after it was released");
+        
+        //escrowed balances are gathered from calls to withdrawSnowflakeBalanceFrom with
+        //address of the resolver smart contract as the to address.
+        snowflake.withdrawSnowflakeBalanceFrom(ein, address(this), amount);
+        
+        debt.principal += amount;
+        debt.interest = (debt.principal * debt.apr);
         debts[debtToPayee[debtId]][debtId] = debt;
-        //Escrow escrow = (new Escrow).value(msg.value)(debtId, msg.sender, debtToPayee[debtId]);
-        //debtToEscrow[debtId] = escrow;
-        //snowflake.transferSnowflakeBalanceFrom(ein, invoices[invoiceId].merchant, amount);
+        
+        //snowflake.transferSnowflakeBalanceFrom(ein, debt.payee, amount);            
+    }
+
+    function getBlockInterval(uint _schedule) returns (uint256) {
+        uint256 interval = 0;
+        if (_schedule == Schedule.Hourly)             interval = blocksPerDay / 24;
+        else if (_schedule == Schedule.Daily)         interval = blocksPerDay;
+        else if (_schedule == Schedule.Weekly)        interval = blocksPerWeek;
+        else if (_schedule == Schedule.Fortnightly)   interval = blocksPerWeek * 2;
+        else if (_schedule == Schedule.Monthly)       interval = blocksPerMonth;
+        else if (_schedule == Schedule.Quadannually)  interval = blocksPerYear / 4;
+        else if (_schedule == Schedule.Triannually)   interval = blocksPerMonth * 4;
+        else if (_schedule == Schedule.Biannually)    interval = blocksPerYear / 2;
+        else if (_schedule == Schedule.Annually)      interval = blocksPerYear;
+        else if (_schedule == Schedule.Biennially)    interval = blocksPerYear * 2;
+        else if (_schedule == Schedule.Triennially)   interval = blocksPerYear * 3;
+        else if (_schedule == Schedule.Quadrennially) interval = blocksPerYear * 4;
+        require(interval, "incomprehensible schedule");
+        return interval;
     }
 
     /**
@@ -204,9 +258,11 @@ contract Glacier is SnowflakeResolver
         uint256 payee = debtToPayee[debtId];
         require(ein == payee, "only payee can change accrual schedule");
         
-        Debt memory debt = debts[payee][debtId]; //TODO: can do, with Raindrop
-        require(debt.payer == 0, "cannot change schedule while engaged");
-
+        //TODO: can do after owed = true, with Raindrop
+        Debt memory debt = debts[payee][debtId];
+        require(!debt.owed, "cannot change payment schedule after principal released");
+        
+        debt.accrualInterval = getBlockInterval(_accrual);
         debt.accruals = Schedule(_accrual);
         debts[debtToPayee[debtId]][debtId] = debt;
     }
@@ -230,22 +286,115 @@ contract Glacier is SnowflakeResolver
         uint256 payee = debtToPayee[debtId];
         require(ein == payee, "only payee can change payment schedule");
         
-        Debt memory debt = debts[payee][debtId]; //TODO: can do, with Raindrop
-        require(debt.payer == 0, "cannot change schedule while engaged");
+        //TODO: can do after owed = true, with Raindrop
+        Debt memory debt = debts[payee][debtId]; 
+        require(!debt.owed, "cannot change payment schedule after principal released");
 
+        debt.payInterval = getBlockInterval(_payment);
         debt.payments = Schedule(_payment);
         debts[debtToPayee[debtId]][debtId] = debt;
     }
 
-     /**
+    /**
      * @dev Set the End date when principal should be sent back to payer
      * @param debtId the id of the debt
      */
-    // function setDeadline(
-    //     uint256 debtId,
-    // ) public {
+    function setDeadline(
+        uint256 debtId,
+    ) public {
+        
+    }
 
-    // }
+    /** 
+     * @dev Set principal amount, creating an escrow
+     * @param debtId id of the debt
+     * @param amount of the principle to put
+     * Upon debt issuance, collateral tokens
+     * are locked in escrow. 
+     * Effectively borrower is buying back those tokens. 
+     * If borrower is unable to buy back token at a 
+     * scheduled time, lender will repossess tokens
+     * worth that missed payment providing better 
+     * breathing space in tough times.
+     */
+    function lockInterest(
+        uint256 debtId,
+        uint256 amount
+    ) public payable {
+        SnowflakeInterface snowflake = SnowflakeInterface(snowflakeAddress);
+        IdentityRegistryInterface identityRegistry = IdentityRegistryInterface(snowflake.identityRegistryAddress());
+
+        uint256 ein = identityRegistry.getEIN(msg.sender);
+        require(identityRegistry.isResolverFor(ein, address(this)), "The EIN has not set this resolver.");
+        
+        uint256 payee = debtToPayee[debtId];
+        Debt memory debt = debts[payee][debtId];
+        require(!debt.owed, "cannot lock more interest after principal was released");
+
+        if (debt.payer == 0) {
+            require(ein != payee, "payer cannot be the payee");
+            debt.payer = ein;
+        } else 
+            require(ein == debt.payer, "payer cannot be the payee");
+        
+        uint256 newInterest = debt.interestLocked + amount;
+
+        if (debt.interest == newInterest) {
+            withdrawHydroBalanceTo(msg.sender, debt.principal);
+            debt.nextAccrual = now + debt.accrueInterval;
+            debt.nextPayment = now + debt.payInterval;
+            debt.owed = true;
+        }
+        else {
+            require(debt.interest > newInterest, "cannot lock more interest than due");
+            snowflake.withdrawSnowflakeBalanceFrom(ein, address(this), amount);    
+        }
+        debt.lockedInterest = newInterest;
+        debts[payee][debtId] = debt;
+    }
+
+    /** 
+     * @dev Set principal amount, creating an escrow
+     * @param debtId id of the debt
+     * @param amount of the principle to put
+     * Upon debt issuance, collateral tokens
+     * are locked in escrow. 
+     * Effectively borrower is buying back those tokens. 
+     * If borrower is unable to buy back token at a 
+     * scheduled time, lender will repossess tokens
+     * worth that missed payment providing better 
+     * breathing space in tough times.
+     */
+    function payInterest(
+        uint256 debtId,
+        uint256 amount
+    ) public payable {
+        SnowflakeInterface snowflake = SnowflakeInterface(snowflakeAddress);
+        IdentityRegistryInterface identityRegistry = IdentityRegistryInterface(snowflake.identityRegistryAddress());
+
+        uint256 ein = identityRegistry.getEIN(msg.sender);
+        require(identityRegistry.isResolverFor(ein, address(this)), "The EIN has not set this resolver.");
+        
+        uint256 payee = debtToPayee[debtId];
+        require(ein == payee, "only payee can change payment schedule");
+
+        Debt memory debt = debts[payee][debtId];
+        require(debt.owed, "cannot lock more interest after principal was released");
+        require(now >= debt.nextPayment && now <= debt.nextPayment + 20, "payment too early/late");
+        
+        //calculate accrued interest
+        //uint n = blocksPerYear / debt.accrualInterval;
+        //debt.principal * (1+debt.apr/n)^n
+        
+        require(debt.accrued >= amount, "payee cannot withdraw more interest than accrued");
+    
+        withdrawHydroBalanceTo(msg.sender, amount);
+        debt.accrued -= amount;
+        debt.nextPayment += debt.payInterval;
+       
+        debts[payee][debtId] = debt;
+    }
+
     
     /**
      * @dev Set the payer and payee attributes
@@ -270,9 +419,24 @@ contract Glacier is SnowflakeResolver
 
     // }
 
+    // function release() {
+        //withdrawHydroBalanceTo
+    //}
+       
     // function repay() {
+        SnowflakeInterface snowflake = SnowflakeInterface(snowflakeAddress);
+        IdentityRegistryInterface identityRegistry = IdentityRegistryInterface(snowflake.identityRegistryAddress());
         
-    // }
+        bytes memory snowflakeCallData;
+        string memory functionSignature = "function processTransaction(address, uint, uint, uint, uint)";
+        snowflakeCallData = abi.encodeWithSelector(bytes4(keccak256(bytes(functionSignature))), address(this), identityRegistry.getEIN(approvingAddress), ownerEIN(), itemListings[id].price, couponID);
 
+        //Any Resolver maintaining a HYDRO token balance may call transferHydroBalanceTo with a target EIN and an amount to send HYDRO to an EIN.
+
+
+// function transferSnowflakeBalanceFromVia(uint einFrom, address via, uint einTo, uint amount, bytes memory _bytes)
+
+        snowflake.transferSnowflakeBalanceFromVia(identityRegistry.getEIN(approvingAddress), _MarketplaceCouponViaAddress, ownerEIN(), itemListings[id].price, snowflakeCallData);
+    // }
 
 }
