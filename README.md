@@ -27,5 +27,4 @@ An Ethereum smart contract on top of Hydro Snowflake that allows a certain perce
 The interest rate, once set, cannot be edited or modified. The terms can be deleted by mutual consent of both parties via a Hydro Raindrop transaction.
 
 # References
-* https://medium.com/aztec-protocol/how-to-code-your-own-confidential-token-on-ethereum-4a8c045c8651
 * https://medium.com/hydrogen-api/examining-erc-1484-hydro-snowflake-cc3753a5ff52
