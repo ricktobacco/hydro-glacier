@@ -416,7 +416,7 @@ contract Glacier is SnowflakeResolver, Formula
         );
 
         bool tooEarly = debt.nextPayment > block.number;
-        bool tooLate = block.number > (debt.nextPayment + 42); //nearly 11 min grace period
+        bool tooLate = block.number > (debt.nextPayment + 42); // nearly 11 min grace period
         require(!tooEarly && !tooLate, "payment too early/late");
 
         withdrawHydroBalanceTo(msg.sender, debt.payment); // release from escrow to payee
@@ -460,8 +460,19 @@ contract Glacier is SnowflakeResolver, Formula
 
         snowflake.transferSnowflakeBalanceFrom(ein, payee, amount);
 
-        if (debt.principal == 0)
+        if (debt.principal == 0) {
             debt.status = Status.Repaid;
+            /* remaining interest payments after principal
+             * is fully repaid are refunded to payer
+             */
+            if (debt.interest > 0) {
+                // if less than halfway into current iteration of payment schedule
+                if (debt.nextPayment > block.number  + debt.payInterval / 2000)
+                    withdrawHydroBalanceTo(msg.sender, debt.interest);
+                else if (debt.interest > debt.payment)
+                    withdrawHydroBalanceTo(msg.sender, debt.interest - debt.payment);     
+            }   
+        }
 
         debts[payee][debtID] = debt;
 
